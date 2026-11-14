@@ -10,11 +10,14 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+from cryptography.exceptions import InvalidTag
 
 from . import crypto
 from .db import connect
@@ -94,6 +97,8 @@ class Service:
         self.stop_event = threading.Event()
         # upload_id -> DEK（明文 DEK 只存在于内存，绝不落盘）
         self._upload_deks: dict[str, bytes] = {}
+        # repair_id -> 备份原件明文（仅在内存中参与校验/重加密，绝不落盘）
+        self._repair_plaintexts: dict[str, bytes] = {}
         # kek_id -> 明文 KEK 的内存缓存（落盘副本只在 keys/ 目录）
         self._kek_cache: dict[int, bytes] = {}
         # 运行中的轮换线程（同期只允许一个）
@@ -151,6 +156,14 @@ class Service:
     def _staging_path(self, upload_id: str, nonce: bytes) -> str:
         return os.path.join(self.staging_dir, f"{upload_id}.{nonce.hex()}.staging")
 
+    def _repair_new_path(self, repair_id: str) -> str:
+        """修复新密文的暂存路径（与原件备份不同，落盘的只是 DEK 加密后的密文）。"""
+        return os.path.join(self.staging_dir, f"repair-{repair_id}.new")
+
+    def _repair_backup_path(self, file_id: str) -> str:
+        """替换密文时对旧密文的同目录备份路径（同目录保证 os.replace 原子）。"""
+        return os.path.join(self.vault_dir, f"{file_id}.blob.bak")
+
     def _get_kek(self, kek_pk: int) -> bytes:
         kek = self._kek_cache.get(kek_pk)
         if kek is not None:
@@ -202,6 +215,22 @@ class Service:
                 "nonce=NULL, updated_at=? WHERE state IN ('accepted','unwrapping')",
                 (now,),
             )
+
+            # 2b) 未完成修复：内存中的备份原件已随进程消失，无法继续，标记中断；
+            #     已在内存中（尚未落盘）的明文本来就没有磁盘副本需要清理。
+            self.conn.execute(
+                "UPDATE repairs SET state='interrupted', wrapped_dek=NULL, dek_nonce=NULL, "
+                "nonce=NULL, error=?, updated_at=? WHERE state IN ('accepted','verified')",
+                ("进程重启，内存中的备份原件丢失，修复中断", now),
+            )
+            self._repair_plaintexts.clear()
+
+            # 2c) 修复替换的崩溃对账：保证 files 行始终指向一份可读密文。
+            #   - staging/repair-*.new：新密文暂存，未提交前一律可删；
+            #   - vault/*.blob.bak：os.replace 交换产生的旧密文备份。若 files 行
+            #     的 nonce 与现网 blob 不匹配而与备份匹配（事务未提交即崩溃），
+            #     用备份还原现网副本；已完成修复遗留的备份直接删除。
+            self._reconcile_repair_leftovers_locked()
 
             # 3) 清理没有任何 upload 引用的孤儿暂存文件（上次崩溃残留）。
             referenced = {
@@ -291,6 +320,49 @@ class Service:
         if path:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
+
+    def _reconcile_repair_leftovers_locked(self) -> None:
+        """启动时对账修复替换可能留下的临时/备份文件，恢复“原有可读副本”。
+
+        崩溃点与处理（全程在恢复阶段、无并发）：
+        * 新密文还在 staging/（尚未替换现网 blob）：直接删除，files 行未动；
+        * 现网 blob 已被换成新密文、旧密文留在 *.bak，但事务未提交
+          （files.nonce 仍与备份一致）：用备份还原现网副本；
+        * 事务已提交（files.nonce 与现网一致）但备份未及删除：删除备份；
+        * 找不到任何 files 行引用的游离备份：直接删除。
+        """
+        for name in list(os.listdir(self.staging_dir)):
+            if name.startswith("repair-") and name.endswith(".new"):
+                self._unlink_quiet(os.path.join(self.staging_dir, name))
+
+        for name in list(os.listdir(self.vault_dir)):
+            if not name.endswith(".blob.bak"):
+                continue
+            file_id = name[: -len(".blob.bak")]
+            backup_path = os.path.join(self.vault_dir, name)
+            blob_path = self._blob_path(file_id)
+            f = self._row("SELECT * FROM files WHERE file_id=?", (file_id,))
+            if f is None:
+                self._unlink_quiet(backup_path)
+                continue
+            live_nonce = self._blob_nonce_quiet(blob_path)
+            backup_nonce = self._blob_nonce_quiet(backup_path)
+            if live_nonce is not None and live_nonce == f["nonce"]:
+                # 事务已提交，新密文生效：备份是收尾残留。
+                self._unlink_quiet(backup_path)
+            elif backup_nonce is not None and backup_nonce == f["nonce"]:
+                # 事务未提交即崩溃：files 行仍登记旧密文，还原可读副本。
+                os.replace(backup_path, blob_path)
+            else:
+                # 两边都对不上：保留 files 行登记对应的现网副本，丢弃游离备份。
+                self._unlink_quiet(backup_path)
+
+    def _blob_nonce_quiet(self, path: str) -> bytes | None:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(crypto.NONCE_SIZE)
+        except OSError:
+            return None
 
     # ------------------------------------------------------------------ #
     # 上传：created -> pending_register（暂停点：待登记）-> completed
@@ -510,23 +582,43 @@ class Service:
             self.conn.commit()
 
             # 用受理时快照的 KEK / 封装 DEK 解封——不依赖 files 行当前值。
-            kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (dl["kek_id"],))
-            if kek_row is None:
-                raise ServiceError("课题密钥记录缺失，无法解封", 500)
-            if not os.path.exists(self._kek_path(kek_row["key_id"])):
-                raise ServiceError(
-                    "课题密钥文件已被删除，在途下载无法解封（收尾逻辑不应允许此情况）", 500
+            try:
+                kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (dl["kek_id"],))
+                if kek_row is None:
+                    raise ServiceError("课题密钥记录缺失，无法解封", 500)
+                if not os.path.exists(self._kek_path(kek_row["key_id"])):
+                    raise ServiceError(
+                        "课题密钥文件已被删除，在途下载无法解封（收尾逻辑不应允许此情况）", 500
+                    )
+                kek = self._get_kek(kek_row["id"])
+                dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
+
+                with open(f["blob_path"], "rb") as bf:
+                    blob = bf.read()
+                nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
+                try:
+                    plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+                except InvalidTag:
+                    raise ServiceError(
+                        "密文完整性校验失败（GCM 标签不匹配），归档密文可能已损坏，"
+                        "请用留存的原件备份发起修复",
+                        500,
+                    )
+
+                if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
+                    raise ServiceError("解密后摘要校验失败，原件可能已损坏", 500)
+            except (ServiceError, InvalidTag):
+                # 读取失败：释放该下载会话并清空快照封装材料，避免在途计数
+                # 永久阻塞轮换收尾；客户端可重新发起下载（或先修复密文）。
+                self.conn.execute(
+                    "UPDATE downloads SET state='interrupted', wrapped_dek=NULL, dek_nonce=NULL, "
+                    "nonce=NULL, updated_at=? WHERE id=?",
+                    (self._now(), dl["id"]),
                 )
-            kek = self._get_kek(kek_row["id"])
-            dek = crypto.unwrap_dek(kek, dl["dek_nonce"], dl["wrapped_dek"])
-
-            with open(f["blob_path"], "rb") as bf:
-                blob = bf.read()
-            nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
-            plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
-
-            if hashlib.sha256(plaintext).hexdigest() != f["sha256"]:
-                raise ServiceError("解密后摘要校验失败，原件可能已损坏", 500)
+                self.conn.commit()
+                if isinstance(sys.exc_info()[1], ServiceError):
+                    raise
+                raise ServiceError("解封或解密失败，归档密文/封装材料可能已损坏", 500)
 
             # 读完原件后清除受理快照中的封装材料：终态下载不再持有任何 KEK 引用。
             self.conn.execute(
@@ -555,6 +647,289 @@ class Service:
             )
             self.conn.commit()
             return {"download_id": download_id, "state": "aborted"}
+
+    # ------------------------------------------------------------------ #
+    # 密文修复（备份恢复）：accepted -> verified -> completed
+    #   仅当备份的大小与 SHA-256 均与登记值相符时，才用该件 DEK 重新加密
+    #   并替换密文；file_id/摘要等登记信息不变，原件明文与 DEK 绝不落盘。
+    # ------------------------------------------------------------------ #
+    def create_repair(self, file_id: str, declared_size: int) -> dict[str, Any]:
+        if not isinstance(declared_size, int) or declared_size <= 0:
+            raise ServiceError("文件大小必须为正整数", 422)
+        if declared_size > MAX_FILE_SIZE:
+            raise ServiceError(
+                f"备份超过 8 MiB 上限（申报 {declared_size} 字节）", 413
+            )
+        with self.lock:
+            f = self._row("SELECT * FROM files WHERE file_id=?", (file_id,))
+            if f is None:
+                raise ServiceError("归档文件不存在", 404)
+            if declared_size != f["size"]:
+                raise ServiceError(
+                    f"备份大小 {declared_size} 与登记大小 {f['size']} 不一致，拒绝修复", 422
+                )
+            # 同一件影像同时只允许一个在途修复，避免替换互相覆盖。
+            busy = self._row(
+                "SELECT id FROM repairs WHERE file_id=? AND state IN ('accepted','verified')",
+                (f["id"],),
+            )
+            if busy is not None:
+                raise ServiceError("该影像已有进行中的修复会话，请先完成或中止", 409)
+
+            repair_id = uuid.uuid4().hex
+            now = self._now()
+            # 受理即快照 KEK 标识与封装 DEK：在途修复会阻止旧 KEK 退役，
+            # 因此即使随后发起轮换，迟到的修复仍能用快照材料解封该件 DEK。
+            self.conn.execute(
+                "INSERT INTO repairs (repair_id, file_id, declared_size, state, kek_id, "
+                "wrapped_dek, dek_nonce, nonce, created_at, updated_at) "
+                "VALUES (?,?,?, 'accepted', ?,?,?,?,?,?)",
+                (
+                    repair_id,
+                    f["id"],
+                    declared_size,
+                    f["current_kek_id"],
+                    f["wrapped_dek"],
+                    f["dek_nonce"],
+                    f["nonce"],
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            return {
+                "repair_id": repair_id,
+                "file_id": file_id,
+                "filename": f["filename"],
+                "state": "accepted",
+                "expected_size": f["size"],
+                "expected_sha256": f["sha256"],
+            }
+
+    def save_repair_content(self, repair_id: str, content: bytes) -> dict[str, Any]:
+        """接收备份原件：大小与 SHA-256 双校验通过后，明文仅驻内存等待替换。"""
+        if len(content) > MAX_FILE_SIZE:
+            raise ServiceError("备份超过 8 MiB 上限，拒绝修复", 413)
+        with self.lock:
+            rp = self._row("SELECT * FROM repairs WHERE repair_id=?", (repair_id,))
+            if rp is None:
+                raise ServiceError("修复会话不存在", 404)
+            if rp["state"] not in ("accepted", "verified"):
+                raise ServiceError(f"修复会话状态为 {rp['state']}，不能再写入备份", 409)
+
+            f = self._row("SELECT * FROM files WHERE id=?", (rp["file_id"],))
+            if f is None:
+                raise ServiceError("归档文件已不存在", 404)
+
+            if len(content) != rp["declared_size"] or len(content) != f["size"]:
+                self._fail_repair_locked(
+                    rp, f"备份大小 {len(content)} 与登记大小 {f['size']} 不一致"
+                )
+                raise ServiceError(
+                    f"备份大小 {len(content)} 与登记大小 {f['size']} 不一致，拒绝修复", 422
+                )
+            digest = hashlib.sha256(content).hexdigest()
+            if digest != f["sha256"]:
+                self._fail_repair_locked(rp, "备份 SHA-256 与登记摘要不一致")
+                raise ServiceError("备份 SHA-256 与登记摘要不一致，拒绝修复", 422)
+
+            now = self._now()
+            self.conn.execute(
+                "UPDATE repairs SET state='verified', sha256=?, updated_at=? WHERE id=?",
+                (digest, now, rp["id"]),
+            )
+            self.conn.commit()
+            # 双校验通过：备份原件明文只放内存，绝不落盘。
+            self._repair_plaintexts[repair_id] = content
+            return {
+                "repair_id": repair_id,
+                "file_id": f["file_id"],
+                "state": "verified",
+                "sha256": digest,
+                "size": len(content),
+            }
+
+    def complete_repair(self, repair_id: str) -> dict[str, Any]:
+        """用该件数据密钥重新加密备份并原子替换密文；任何失败都保住原有副本。"""
+        with self.lock:
+            rp = self._row("SELECT * FROM repairs WHERE repair_id=?", (repair_id,))
+            if rp is None:
+                raise ServiceError("修复会话不存在", 404)
+            if rp["state"] == "completed":
+                return self._repair_payload(rp)
+            if rp["state"] not in ("accepted", "verified"):
+                raise ServiceError(f"修复会话状态为 {rp['state']}，无法完成修复", 409)
+
+            content = self._repair_plaintexts.get(repair_id)
+            if content is None:
+                # 进程重启后内存明文已丢失（恢复阶段通常已标记 interrupted，这里兜底）。
+                self._fail_repair_locked(rp, "备份原件已不在内存（可能经历重启），请重新发起修复")
+                raise ServiceError("备份原件已不在内存（可能经历重启），请重新发起修复", 409)
+
+            f = self._row("SELECT * FROM files WHERE id=?", (rp["file_id"],))
+            if f is None:
+                raise ServiceError("归档文件已不存在", 404)
+
+            new_path: str | None = None
+            backup_path: str | None = None
+            try:
+                # 1) 用受理快照中的 KEK/封装 DEK 解封该件数据密钥。旧 KEK 在
+                #    在途修复结束前不会被轮换收尾删除，因此这里恒可解封。
+                kek_row = self._row("SELECT * FROM project_keys WHERE id=?", (rp["kek_id"],))
+                if kek_row is None or not os.path.exists(self._kek_path(kek_row["key_id"])):
+                    raise ServiceError("快照课题密钥不可用，无法解封该件数据密钥", 500)
+                try:
+                    dek = crypto.unwrap_dek(
+                        self._get_kek(kek_row["id"]), rp["dek_nonce"], rp["wrapped_dek"]
+                    )
+                except InvalidTag:
+                    raise ServiceError("封装数据密钥解封失败，拒绝替换密文", 500)
+
+                # 2) 同一 DEK、新随机 nonce 重新加密备份原件（明文不落盘）。
+                new_nonce = crypto.new_nonce()
+                ciphertext = crypto.encrypt_blob(dek, new_nonce, content)
+                new_path = self._repair_new_path(repair_id)
+                self._atomic_write(new_path, new_nonce + ciphertext)
+
+                # 3) 同目录原子交换：旧密文先改名备份，再放新密文。
+                #    任何一步失败现网 blob 都保持原样，原有可读副本不丢失。
+                blob_path = f["blob_path"]
+                backup_path = self._repair_backup_path(f["file_id"])
+                self._unlink_quiet(backup_path)
+                os.replace(blob_path, backup_path)
+                try:
+                    os.replace(new_path, blob_path)
+                except BaseException:
+                    # 新密文落位失败：立即还原旧密文，恢复到修复前状态。
+                    with contextlib.suppress(OSError):
+                        os.replace(backup_path, blob_path)
+                    raise
+
+                # 4) 元数据与替换在同一事务提交；file_id/文件名/大小/摘要均不变。
+                now = self._now()
+                self.conn.execute(
+                    "UPDATE files SET nonce=? WHERE id=?", (new_nonce, f["id"])
+                )
+                # 先前已受理但尚未读取（或正在解封）的下载：把 nonce 快照指向
+                # 新密文，其 DEK 未变，恢复后读取得到的是完整原件。
+                self.conn.execute(
+                    "UPDATE downloads SET nonce=?, updated_at=? "
+                    "WHERE file_id=? AND state IN ('accepted','unwrapping')",
+                    (new_nonce, now, f["id"]),
+                )
+                self.conn.execute(
+                    "UPDATE repairs SET state='completed', nonce=?, wrapped_dek=NULL, "
+                    "dek_nonce=NULL, updated_at=? WHERE id=?",
+                    (new_nonce, now, rp["id"]),
+                )
+                self.conn.commit()
+            except ServiceError:
+                # 业务失败：清理暂存、确保旧副本在位，修复会话标记 failed 后可重新发起。
+                self._rollback_repair_files(rp, f, new_path, backup_path)
+                self._fail_repair_locked(rp, "修复替换失败，已保留原有可读副本")
+                raise
+            except Exception as exc:
+                # 任何替换异常都不能破坏现网可读副本：还原现场并转为业务错误。
+                self._rollback_repair_files(rp, f, new_path, backup_path)
+                self._fail_repair_locked(rp, f"修复过程异常，已保留原有可读副本：{exc}")
+                raise ServiceError(f"修复替换失败，已保留原有可读副本：{exc}", 500)
+
+            # 5) 提交后再删除旧密文备份；若此处崩溃，重启对账会识别已提交状态并清理。
+            self._unlink_quiet(backup_path)
+            self._repair_plaintexts.pop(repair_id, None)
+            return self._repair_payload(
+                self._row("SELECT * FROM repairs WHERE id=?", (rp["id"],))  # type: ignore[arg-type]
+            )
+
+    def _rollback_repair_files(
+        self,
+        rp: sqlite3.Row,
+        f: sqlite3.Row,
+        new_path: str | None,
+        backup_path: str | None,
+    ) -> None:
+        """替换失败后恢复现场：旧密文还原到 blob_path，新密文暂存删除。"""
+        blob_path = f["blob_path"]
+        if backup_path and os.path.exists(backup_path):
+            if not os.path.exists(blob_path):
+                with contextlib.suppress(OSError):
+                    os.replace(backup_path, blob_path)
+            else:
+                # 现网副本仍在（例如失败发生在第一次 replace 之前）：丢弃备份。
+                self._unlink_quiet(backup_path)
+        if new_path:
+            self._unlink_quiet(new_path)
+
+    def _fail_repair_locked(self, rp: sqlite3.Row, error: str) -> None:
+        self._repair_plaintexts.pop(rp["repair_id"], None)
+        self.conn.execute(
+            "UPDATE repairs SET state='failed', error=?, wrapped_dek=NULL, dek_nonce=NULL, "
+            "nonce=NULL, updated_at=? WHERE id=?",
+            (error, self._now(), rp["id"]),
+        )
+        self.conn.commit()
+
+    def abort_repair(self, repair_id: str) -> dict[str, Any]:
+        with self.lock:
+            rp = self._row("SELECT * FROM repairs WHERE repair_id=?", (repair_id,))
+            if rp is None:
+                raise ServiceError("修复会话不存在", 404)
+            if rp["state"] in ("completed", "aborted", "failed", "interrupted"):
+                return self._repair_payload(rp)
+            f = self._row("SELECT * FROM files WHERE id=?", (rp["file_id"],))
+            # 在途中止：清理可能已暂存的新密文，现网密文从未被改动。
+            self._unlink_quiet(self._repair_new_path(repair_id))
+            if f is not None:
+                self._unlink_quiet(self._repair_backup_path(f["file_id"]))
+            self._repair_plaintexts.pop(repair_id, None)
+            self.conn.execute(
+                "UPDATE repairs SET state='aborted', wrapped_dek=NULL, dek_nonce=NULL, "
+                "nonce=NULL, updated_at=? WHERE id=?",
+                (self._now(), rp["id"]),
+            )
+            self.conn.commit()
+            return self._repair_payload(
+                self._row("SELECT * FROM repairs WHERE id=?", (rp["id"],))  # type: ignore[arg-type]
+            )
+
+    def _repair_payload(self, rp: sqlite3.Row) -> dict[str, Any]:
+        f = self._row("SELECT file_id, filename FROM files WHERE id=?", (rp["file_id"],))
+        return {
+            "repair_id": rp["repair_id"],
+            "file_id": f["file_id"] if f else None,
+            "filename": f["filename"] if f else None,
+            "state": rp["state"],
+            "sha256": rp["sha256"],
+            "error": rp["error"],
+        }
+
+    def list_repairs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self._all(
+                "SELECT r.repair_id, r.state, r.declared_size, r.sha256, r.error, "
+                "r.created_at, r.updated_at, f.file_id AS file_id, f.filename AS filename "
+                "FROM repairs r JOIN files f ON f.id=r.file_id ORDER BY r.id DESC"
+            )
+            return [dict(r) for r in rows]
+
+    def corrupt_file_for_demo(self, file_id: str) -> dict[str, Any]:
+        """演示辅助：翻转 vault 密文若干字节，制造 GCM 标签校验失败的损坏场景。
+
+        只动密文文件，不触碰数据库登记信息与密钥；损坏后下载应报错，
+        用留存的原件备份修复后恢复可读。
+        """
+        with self.lock:
+            f = self._row("SELECT * FROM files WHERE file_id=?", (file_id,))
+            if f is None:
+                raise ServiceError("文件不存在", 404)
+            with open(f["blob_path"], "r+b") as fh:
+                fh.seek(crypto.NONCE_SIZE + 7)
+                byte = fh.read(1)
+                fh.seek(crypto.NONCE_SIZE + 7)
+                fh.write(bytes([byte[0] ^ 0xFF]))
+                fh.flush()
+                os.fsync(fh.fileno())
+            return {"file_id": file_id, "state": "corrupted", "blob_path": f["blob_path"]}
 
     # ------------------------------------------------------------------ #
     # 密钥轮换：同期只允许一个；只重封装 DEK，不改原件密文
@@ -628,7 +1003,7 @@ class Service:
                     self._rewrap_one_locked(target, old, new, rot)
                     continue
 
-                # 2) 等待在途会话全部结束。
+                # 2) 等待在途会话全部结束（在途修复同样阻塞旧 KEK 退役）。
                 blocking_uploads = self._row(
                     "SELECT COUNT(*) AS c FROM uploads "
                     "WHERE state IN ('created','pending_register')"
@@ -637,14 +1012,19 @@ class Service:
                     "SELECT COUNT(*) AS c FROM downloads "
                     "WHERE state IN ('accepted','unwrapping')"
                 )["c"]
+                blocking_repairs = self._row(
+                    "SELECT COUNT(*) AS c FROM repairs "
+                    "WHERE state IN ('accepted','verified') AND kek_id=?",
+                    (old["id"],),
+                )["c"]
                 self.conn.execute(
                     "UPDATE rotations SET state='completing', blocking_uploads=?, "
-                    "blocking_downloads=? WHERE id=?",
-                    (blocking_uploads, blocking_downloads, rot["id"]),
+                    "blocking_downloads=?, blocking_repairs=? WHERE id=?",
+                    (blocking_uploads, blocking_downloads, blocking_repairs, rot["id"]),
                 )
                 self.conn.commit()
 
-                if blocking_uploads == 0 and blocking_downloads == 0:
+                if blocking_uploads == 0 and blocking_downloads == 0 and blocking_repairs == 0:
                     # 3) 所有旧钥引用与在途使用均已结束，实际删除旧 KEK 文件后才报完成。
                     self._finalize_rotation_locked(rot)
                     return
@@ -685,12 +1065,23 @@ class Service:
             "AND kek_id=?",
             (rot["old_kek_id"],),
         )["c"]
-        # 强不变量：数据库中不允许再保留任何指向旧 KEK 的封装 DEK（终态下载已清空）。
+        # 在途修复持有旧 KEK 的封装快照：未结束前旧钥文件不得删除，
+        # 否则“迟到的修复”将无法解封 DEK、变成不可解密文件。
+        rp = self._row(
+            "SELECT COUNT(*) AS c FROM repairs WHERE state IN ('accepted','verified') "
+            "AND kek_id=?",
+            (rot["old_kek_id"],),
+        )["c"]
+        # 强不变量：数据库中不允许再保留任何指向旧 KEK 的封装 DEK（终态下载/修复已清空）。
         residual = self._row(
             "SELECT COUNT(*) AS c FROM downloads WHERE kek_id=? AND wrapped_dek IS NOT NULL",
             (rot["old_kek_id"],),
         )["c"]
-        if refs or up or dl or residual:
+        residual_rp = self._row(
+            "SELECT COUNT(*) AS c FROM repairs WHERE kek_id=? AND wrapped_dek IS NOT NULL",
+            (rot["old_kek_id"],),
+        )["c"]
+        if refs or up or dl or rp or residual or residual_rp:
             return  # 条件未满足，下一轮再检查。
 
         path = self._kek_path(old["key_id"])
@@ -705,7 +1096,8 @@ class Service:
         )
         self.conn.execute(
             "UPDATE rotations SET state='completed', completed_at=?, blocking_uploads=0, "
-            "blocking_downloads=0, message='旧钥引用与在途使用全部结束，旧课题密钥文件已删除' WHERE id=?",
+            "blocking_downloads=0, blocking_repairs=0, "
+            "message='旧钥引用与在途使用全部结束，旧课题密钥文件已删除' WHERE id=?",
             (now, rot["id"]),
         )
         self.conn.commit()
@@ -751,6 +1143,7 @@ class Service:
             "rewrapped": row["rewrapped"],
             "blocking_uploads": row["blocking_uploads"],
             "blocking_downloads": row["blocking_downloads"],
+            "blocking_repairs": row["blocking_repairs"],
             "old_kek_id": row["old_kek_id"],
             "new_kek_id": row["new_kek_id"],
             "started_at": row["started_at"],

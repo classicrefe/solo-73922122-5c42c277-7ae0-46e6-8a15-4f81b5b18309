@@ -7,7 +7,9 @@
 4. 上传待登记暂停：收尾后不留下旧钥引用；
 5. 下载待解封暂停：已受理下载必须读完原件；
 6. 轮换中重启自动续办，已归档文件始终可解密；
-7. 同期只允许一次轮换。
+7. 同期只允许一次轮换；
+8. 密文修复（备份恢复）：双校验、原子替换保住可读副本、在途修复阻塞
+   旧钥退役、迟到修复仍可解密、重启对账与已受理下载的原件完整性。
 """
 
 from __future__ import annotations
@@ -353,3 +355,309 @@ class TestArchive:
             # 重新上传仍然成功。
             new_id = _upload(client, payload, "orphan.tif")
             assert _download(client, new_id) == payload
+
+
+def _repair(client: TestClient, file_id: str, backup: bytes) -> dict:
+    r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(backup)})
+    assert r.status_code == 201, r.text
+    rid = r.json()["repair_id"]
+    r = client.put(f"/api/repairs/{rid}/content", content=backup)
+    assert r.status_code == 200, r.text
+    r = client.post(f"/api/repairs/{rid}/complete")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestRepair:
+    def test_repair_restores_corrupted_blob_and_keeps_identity(self, svc, tmp_data):
+        client, service = svc
+        payload = make_tiff(2048, 3)
+        file_id = _upload(client, payload)
+        before = client.get("/api/files").json()[0]
+
+        # 损坏 vault 密文：下载应报 GCM 完整性失败。
+        r = client.post(f"/api/files/{file_id}/demo/corrupt")
+        assert r.status_code == 200
+        r = client.post(f"/api/files/{file_id}/downloads")
+        dl = r.json()["download_id"]
+        r = client.get(f"/api/downloads/{dl}/content")
+        assert r.status_code == 500 and "GCM" in r.json()["error"]
+
+        # 用留存的原件备份修复。
+        done = _repair(client, file_id, payload)
+        assert done["state"] == "completed" and done["file_id"] == file_id
+
+        # 文件 ID、大小、摘要等登记信息不变，仅密文 nonce 变化。
+        after = next(f for f in client.get("/api/files").json() if f["file_id"] == file_id)
+        assert after["file_id"] == before["file_id"]
+        assert after["sha256"] == before["sha256"]
+        assert after["size"] == before["size"]
+        assert after["filename"] == before["filename"]
+        assert after["created_at"] == before["created_at"]
+        import sqlite3
+
+        conn = sqlite3.connect(os.path.join(tmp_data, "archive.db"))
+        row = conn.execute("SELECT nonce FROM files WHERE file_id=?", (file_id,)).fetchone()
+        conn.close()
+        assert row[0] is not None
+        # 新下载得到完整原件；可重复修复。
+        assert _download(client, file_id) == payload
+        assert _repair(client, file_id, payload)["state"] == "completed"
+        assert _download(client, file_id) == payload
+
+    def test_repair_rejects_size_or_digest_mismatch(self, svc, tmp_data):
+        client, _ = svc
+        payload = make_tiff(1200, 4)
+        file_id = _upload(client, payload)
+
+        # 大小不符（受理阶段即拒绝）。
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload) + 1})
+        assert r.status_code == 422
+        # 同大小但内容不同 -> SHA-256 不符，写入阶段拒绝，会话 failed。
+        wrong = make_tiff(1200, 99)
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(wrong)})
+        rid = r.json()["repair_id"]
+        r = client.put(f"/api/repairs/{rid}/content", content=wrong)
+        assert r.status_code == 422 and "SHA-256" in r.json()["error"]
+        rp = next(x for x in client.get("/api/repairs").json() if x["repair_id"] == rid)
+        assert rp["state"] == "failed"
+        # 失败后原密文仍可读，且可以重新发起修复。
+        assert _download(client, file_id) == payload
+        assert _repair(client, file_id, payload)["state"] == "completed"
+        assert _download(client, file_id) == payload
+
+    def test_repair_enforces_8mib_limit_and_plaintext_never_on_disk(self, svc, tmp_data):
+        client, _ = svc
+        payload = make_tiff(4096, 6)
+        file_id = _upload(client, payload)
+
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": MAX_FILE_SIZE + 1})
+        assert r.status_code == 413
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        rid = r.json()["repair_id"]
+        r = client.put(f"/api/repairs/{rid}/content", content=b"x" * (MAX_FILE_SIZE + 1))
+        assert r.status_code == 413
+        # 超限内容被拒后会话仍停在 accepted，中止后才能重新发起。
+        assert client.post(f"/api/repairs/{rid}/abort").status_code == 200
+
+        # 修复全流程后，磁盘上任何文件都不含备份明文/TIFF 魔数，
+        # 数据库内不残留修复会话的封装材料。
+        _repair(client, file_id, payload)
+        for root, _dirs, files in os.walk(tmp_data):
+            for name in files:
+                path = os.path.join(root, name)
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                if "vault" in path or "staging" in path:
+                    assert payload not in data
+                    assert b"II\x2a\x00" not in data
+        # 修复结束后无 .new/.bak 残留。
+        assert os.listdir(os.path.join(tmp_data, "staging")) == []
+        assert [n for n in os.listdir(os.path.join(tmp_data, "vault")) if n.endswith((".bak", ".new"))] == []
+        import sqlite3
+
+        conn = sqlite3.connect(os.path.join(tmp_data, "archive.db"))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM repairs WHERE state='completed' AND wrapped_dek IS NOT NULL"
+        ).fetchone()[0] == 0
+        conn.close()
+
+    def test_inflight_repair_blocks_old_kek_retirement_late_repair_still_decodable(
+        self, svc, tmp_data
+    ):
+        client, _ = svc
+        payload = make_tiff(1800, 8)
+        file_id = _upload(client, payload)
+        old_kek_id = client.get("/api/rotations/current").json()["active_kek"]["id"]
+        old_path = os.path.join(
+            tmp_data, "keys",
+            next(k["key_id"] for k in client.get("/api/keys").json() if k["id"] == old_kek_id)
+            + ".kek")
+
+        # 先受理修复并完成双校验（备份明文驻内存），再发起轮换。
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        rid = r.json()["repair_id"]
+        assert client.put(f"/api/repairs/{rid}/content", content=payload).status_code == 200
+        assert client.post("/api/rotations").status_code == 201
+        wait_until(lambda: (
+            (s := client.get("/api/rotations/current").json())["active"]
+            and s["state"] == "completing"))
+        st = client.get("/api/rotations/current").json()
+        assert st["blocking_repairs"] == 1
+        assert os.path.exists(old_path), "在途修复结束前旧 KEK 文件不得删除"
+
+        # “迟到”的修复此刻才完成替换：仍能用快照旧 KEK 解封 DEK。
+        r = client.post(f"/api/repairs/{rid}/complete")
+        assert r.status_code == 200 and r.json()["state"] == "completed"
+        wait_until(lambda: not client.get("/api/rotations/current").json()["active"])
+        assert not os.path.exists(old_path)
+        # 旧钥退役后修复件仍可解密，且封装已随轮换迁到新 KEK。
+        assert _download(client, file_id) == payload
+        f = next(x for x in client.get("/api/files").json() if x["file_id"] == file_id)
+        assert f["kek_id"] != old_kek_id
+
+    def test_repair_after_completed_rotation_uses_current_key(self, svc, tmp_data):
+        client, _ = svc
+        payload = make_tiff(900, 12)
+        file_id = _upload(client, payload)
+        client.post("/api/rotations")
+        wait_until(lambda: not client.get("/api/rotations/current").json()["active"])
+
+        # 旧 KEK 已退役：新受理的修复快照指向当前 active KEK，修复照常成功。
+        r = client.post(f"/api/files/{file_id}/demo/corrupt")
+        assert r.status_code == 200
+        done = _repair(client, file_id, payload)
+        assert done["state"] == "completed"
+        assert _download(client, file_id) == payload
+
+    def test_failed_replacement_keeps_readable_copy(self, svc, tmp_data):
+        client, service = svc
+        payload = make_tiff(700, 13)
+        file_id = _upload(client, payload)
+        blob_path = os.path.join(tmp_data, "vault", file_id + ".blob")
+        with open(blob_path, "rb") as fh:
+            good_blob = fh.read()
+
+        # 让“新密文落位”抛错：替换流程必须还原旧密文，修复会话 failed。
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        rid = r.json()["repair_id"]
+        client.put(f"/api/repairs/{rid}/content", content=payload)
+        original_replace = os.replace
+
+        def broken_replace(src, dst):
+            if str(dst) == blob_path and str(src).endswith(".new"):
+                raise OSError("模拟新密文落位失败")
+            return original_replace(src, dst)
+
+        import app.service as service_mod
+
+        service_mod.os.replace = broken_replace
+        try:
+            r = client.post(f"/api/repairs/{rid}/complete")
+            assert r.status_code == 500
+        finally:
+            service_mod.os.replace = original_replace
+
+        with open(blob_path, "rb") as fh:
+            assert fh.read() == good_blob, "原有可读副本必须保留"
+        rp = next(x for x in client.get("/api/repairs").json() if x["repair_id"] == rid)
+        assert rp["state"] == "failed"
+        assert _download(client, file_id) == payload
+        assert os.listdir(os.path.join(tmp_data, "staging")) == []
+        # 重复修复仍可用。
+        assert _repair(client, file_id, payload)["state"] == "completed"
+        assert _download(client, file_id) == payload
+
+    def test_restart_mid_repair_interrupts_and_reconciles(self, tmp_data, monkeypatch):
+        monkeypatch.setenv("ARCHIVE_DATA_DIR", tmp_data)
+        payload = make_tiff(1500, 15)
+        with TestClient(app) as client:
+            file_id = _upload(client, payload)
+            r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+            rid = r.json()["repair_id"]
+            client.put(f"/api/repairs/{rid}/content", content=payload)
+            assert client.get("/api/repairs").json()[0]["state"] == "verified"
+
+        # 重启：内存备份明文丢失，在途修复标记 interrupted，可重新发起。
+        with TestClient(app) as client:
+            rp = client.get("/api/repairs").json()[0]
+            assert rp["state"] == "interrupted"
+            assert _download(client, file_id) == payload
+            assert _repair(client, file_id, payload)["state"] == "completed"
+            assert _download(client, file_id) == payload
+
+    def test_restart_reconciles_uncommitted_swap_and_committed_backup(
+        self, tmp_data, monkeypatch
+    ):
+        monkeypatch.setenv("ARCHIVE_DATA_DIR", tmp_data)
+        payload = make_tiff(1100, 16)
+        with TestClient(app) as client:
+            file_id = _upload(client, payload)
+            r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+            rid = r.json()["repair_id"]
+            client.put(f"/api/repairs/{rid}/content", content=payload)
+
+            # 手动推进到“现网已换成新密文、旧密文在 .bak、事务未提交”的崩溃点：
+            # complete 内部先做两次 os.replace 再写数据库，这里直接模拟磁盘状态。
+            from app.main import service as current
+
+            f = current._row("SELECT * FROM files WHERE file_id=?", (file_id,))
+            blob_path = f["blob_path"]
+            backup_path = os.path.join(tmp_data, "vault", file_id + ".blob.bak")
+            new_path = os.path.join(tmp_data, "staging", f"repair-{rid}.new")
+            # 用服务原语造一份合法新密文写到暂存（借助一次完整修复后再制造场景过于绕，
+            # 直接复用加密原语与该件 DEK 的内存解封结果）。
+            from app import crypto
+
+            kek = current._get_kek(f["current_kek_id"])
+            dek = crypto.unwrap_dek(kek, f["dek_nonce"], f["wrapped_dek"])
+            nonce = crypto.new_nonce()
+            current._atomic_write(new_path, nonce + crypto.encrypt_blob(dek, nonce, payload))
+            import os as _os
+
+            _os.replace(blob_path, backup_path)  # 现网位置空出
+            _os.replace(new_path, blob_path)     # 新密文落位，但 DB 仍登记旧 nonce
+            # 同时留一个游离的 .new 孤儿
+            with open(os.path.join(tmp_data, "staging", "repair-orphan.new"), "wb") as fh:
+                fh.write(b"orphan")
+
+        # 重启对账：files.nonce 与 .bak 一致 -> 还原旧密文，清理孤儿。
+        with TestClient(app) as client:
+            assert not os.path.exists(backup_path)
+            assert _download(client, file_id) == payload
+            assert os.listdir(os.path.join(tmp_data, "staging")) == []
+            # 旧修复会话被标记 interrupted，重新修复成功。
+            assert client.get("/api/repairs").json()[0]["state"] == "interrupted"
+            assert _repair(client, file_id, payload)["state"] == "completed"
+            assert _download(client, file_id) == payload
+
+    def test_accepted_download_before_repair_gets_full_original_afterward(self, svc):
+        client, _ = svc
+        payload = make_tiff(1300, 21)
+        file_id = _upload(client, payload)
+
+        # 修复受理前先受理一个下载（停在 accepted，尚未解封读取）。
+        r = client.post(f"/api/files/{file_id}/downloads")
+        dl_id = r.json()["download_id"]
+        assert r.json()["state"] == "accepted"
+
+        # 损坏并修复。
+        client.post(f"/api/files/{file_id}/demo/corrupt")
+        assert _repair(client, file_id, payload)["state"] == "completed"
+
+        # 先前已受理但尚未读取的下载同样得到完整原件。
+        r = client.get(f"/api/downloads/{dl_id}/content")
+        assert r.status_code == 200
+        assert r.content == payload
+        # 修复后的新下载也一致。
+        assert _download(client, file_id) == payload
+
+    def test_failed_corrupt_download_releases_session_and_rotation_completes(self, svc):
+        client, _ = svc
+        payload = make_tiff(800, 31)
+        file_id = _upload(client, payload)
+        client.post(f"/api/files/{file_id}/demo/corrupt")
+        dl_id = client.post(f"/api/files/{file_id}/downloads").json()["download_id"]
+        assert client.get(f"/api/downloads/{dl_id}/content").status_code == 500
+        # 失败的下载会话被释放为 interrupted，不再阻塞轮换收尾。
+        dl = next(d for d in client.get("/api/downloads").json() if d["download_id"] == dl_id)
+        assert dl["state"] == "interrupted"
+        assert client.post("/api/rotations").status_code == 201
+        wait_until(lambda: not client.get("/api/rotations/current").json()["active"])
+        # 修复后重新下载得到完整原件。
+        assert _repair(client, file_id, payload)["state"] == "completed"
+        assert _download(client, file_id) == payload
+
+    def test_only_one_inflight_repair_per_file(self, svc):
+        client, _ = svc
+        payload = make_tiff(500, 22)
+        file_id = _upload(client, payload)
+        r = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        assert r.status_code == 201
+        r2 = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        assert r2.status_code == 409
+        # 中止后可重新发起。
+        rid = r.json()["repair_id"]
+        assert client.post(f"/api/repairs/{rid}/abort").status_code == 200
+        r3 = client.post(f"/api/files/{file_id}/repairs", json={"size": len(payload)})
+        assert r3.status_code == 201

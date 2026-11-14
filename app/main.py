@@ -26,6 +26,10 @@ class UploadInit(BaseModel):
     size: int = Field(..., gt=0)
 
 
+class RepairInit(BaseModel):
+    size: int = Field(..., gt=0)
+
+
 class GateBody(BaseModel):
     paused: bool
 
@@ -120,6 +124,38 @@ def abort_download(download_id: str) -> dict[str, Any]:
 @app.get("/api/downloads")
 def list_downloads() -> list[dict[str, Any]]:
     return svc().list_downloads()
+
+
+# --------------------------- 密文修复（备份恢复，三阶段） --------------------------- #
+@app.post("/api/files/{file_id}/repairs", status_code=201)
+def create_repair(file_id: str, body: RepairInit) -> dict[str, Any]:
+    return svc().create_repair(file_id, body.size)
+
+
+@app.put("/api/repairs/{repair_id}/content")
+async def put_repair_content(repair_id: str, request: Request) -> dict[str, Any]:
+    content = await request.body()
+    return svc().save_repair_content(repair_id, content)
+
+
+@app.post("/api/repairs/{repair_id}/complete")
+def complete_repair(repair_id: str) -> dict[str, Any]:
+    return svc().complete_repair(repair_id)
+
+
+@app.post("/api/repairs/{repair_id}/abort")
+def abort_repair(repair_id: str) -> dict[str, Any]:
+    return svc().abort_repair(repair_id)
+
+
+@app.get("/api/repairs")
+def list_repairs() -> list[dict[str, Any]]:
+    return svc().list_repairs()
+
+
+@app.post("/api/files/{file_id}/demo/corrupt")
+def corrupt_file_for_demo(file_id: str) -> dict[str, Any]:
+    return svc().corrupt_file_for_demo(file_id)
 
 
 # --------------------------- 文件与课题密钥 --------------------------- #

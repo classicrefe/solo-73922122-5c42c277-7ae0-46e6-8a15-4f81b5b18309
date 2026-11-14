@@ -185,6 +185,78 @@ for f in img-a img-b; do
 done
 ok "重启后全部已归档文件仍可解密，且与原件逐字节一致"
 
+say "4/ 密文修复：备份恢复（大小 + SHA-256 双校验，原件/DEK 不落盘）"
+# 再上传一件用于修复演示的影像，留存原件备份
+make_tif "$BASE_DIR/samples/img-r.tif" 3072
+FID_R="$(upload "$BASE_DIR/samples/img-r.tif")"
+REG_SIZE="$(stat -c%s "$BASE_DIR/samples/img-r.tif")"
+REG_SHA="$(curl -s "$BASE/api/files" | "$PY" -c 'import sys,json;print(next(x["sha256"] for x in json.load(sys.stdin) if x["file_id"]=="'$FID_R'"))')"
+ok "待修复影像已归档（file_id=${FID_R:0:8}…，SHA-256=${REG_SHA:0:16}…）"
+
+# 4.1 模拟 vault 密文损坏：下载报 GCM 完整性失败
+curl -s -X POST "$BASE/api/files/$FID_R/demo/corrupt" >/dev/null
+DID_BAD="$(curl -s -X POST "$BASE/api/files/$FID_R/downloads" | jget download_id)"
+HTTP_BAD="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/downloads/$DID_BAD/content")"
+[ "$HTTP_BAD" = "500" ] && ok "损坏密文下载被拒（HTTP 500，GCM 标签校验失败）"
+
+# 4.2 错误备份（同大小、不同内容）必须因 SHA-256 不符被拒，且原副本仍在
+BAD_TIF="$BASE_DIR/samples/img-r.bad.tif"
+cp "$BASE_DIR/samples/img-r.tif" "$BAD_TIF"
+"$PY" - "$BAD_TIF" <<'EOF'
+import sys
+path = sys.argv[1]
+with open(path, "r+b") as f:  # 翻转若干字节，保持大小不变、内容不同
+    f.seek(16)
+    b = f.read(4)
+    f.seek(16)
+    f.write(bytes(x ^ 0xA5 for x in b))
+EOF
+RID_BAD="$(curl -s -X POST "$BASE/api/files/$FID_R/repairs" -H 'Content-Type: application/json' \
+  -d "{\"size\":$REG_SIZE}" | jget repair_id)"
+HTTP_BAD2="$(curl -s -o /tmp/demo-bad.json -w '%{http_code}' -X PUT --data-binary "@$BAD_TIF" \
+  "$BASE/api/repairs/$RID_BAD/content")"
+[ "$HTTP_BAD2" = "422" ] && ok "SHA-256 不符的备份被拒绝（HTTP 422），修复会话标记 failed"
+
+# 4.3 正确备份：受理 -> 双校验 -> 同一 DEK 重新加密并原子替换
+RID="$(curl -s -X POST "$BASE/api/files/$FID_R/repairs" -H 'Content-Type: application/json' \
+  -d "{\"size\":$REG_SIZE}" | jget repair_id)"
+curl -s -X PUT --data-binary "@$BASE_DIR/samples/img-r.tif" "$BASE/api/repairs/$RID/content" \
+  | "$PY" -c 'import sys,json;d=json.load(sys.stdin);assert d["state"]=="verified", d'
+curl -s -X POST "$BASE/api/repairs/$RID/complete" \
+  | "$PY" -c 'import sys,json;d=json.load(sys.stdin);assert d["state"]=="completed" and d["file_id"]=="'$FID_R'", d'
+ok "修复完成：文件 ID/摘要不变，仅密文被重新加密替换"
+download "$FID_R" "$BASE_DIR/samples/img-r.repaired.tif"
+cmp "$BASE_DIR/samples/img-r.tif" "$BASE_DIR/samples/img-r.repaired.tif"
+ok "修复后新下载与留存原件逐字节一致；vault 无 .bak/.new 残留：$(ls "$DATA_DIR/vault" | tr '\n' ' ')"
+if grep -rIl $'II\x2a\x00' "$DATA_DIR/vault" "$DATA_DIR/staging" 2>/dev/null; then
+  echo "密文目录中发现明文 TIFF 魔数！"; exit 1
+fi
+ok "修复全程原件明文与数据密钥未落盘（无 TIFF 魔数、无封装材料残留）"
+
+# 4.4 在途修复阻塞旧钥退役：先受理修复，再发起轮换，旧 KEK 文件必须保留
+RID2="$(curl -s -X POST "$BASE/api/files/$FID_R/repairs" -H 'Content-Type: application/json' \
+  -d "{\"size\":$REG_SIZE}" | jget repair_id)"
+curl -s -X PUT --data-binary "@$BASE_DIR/samples/img-r.tif" "$BASE/api/repairs/$RID2/content" >/dev/null
+curl -s -X POST "$BASE/api/rotations" >/dev/null
+sleep 1.0
+curl -s "$BASE/api/rotations/current" | "$PY" -c 'import sys,json;d=json.load(sys.stdin);assert d["active"] and d["blocking_repairs"]==1, d'
+ok "轮换收尾等待在途修复（blocking_repairs=1），旧 KEK 文件尚未退役"
+curl -s -X POST "$BASE/api/repairs/$RID2/complete" | "$PY" -c 'import sys,json;assert json.load(sys.stdin)["state"]=="completed"'
+wait_rotation_done
+download "$FID_R" "$BASE_DIR/samples/img-r.late.tif"
+cmp "$BASE_DIR/samples/img-r.tif" "$BASE_DIR/samples/img-r.late.tif"
+ok "迟到的修复在旧钥退役后仍可解密，下载内容逐字节一致"
+
+# 4.5 修复前已受理、修复后才读取的下载同样得到完整原件
+DID3="$(curl -s -X POST "$BASE/api/files/$FID_R/downloads" | jget download_id)"
+RID3="$(curl -s -X POST "$BASE/api/files/$FID_R/repairs" -H 'Content-Type: application/json' \
+  -d "{\"size\":$REG_SIZE}" | jget repair_id)"
+curl -s -X PUT --data-binary "@$BASE_DIR/samples/img-r.tif" "$BASE/api/repairs/$RID3/content" >/dev/null
+curl -s -X POST "$BASE/api/repairs/$RID3/complete" >/dev/null
+curl -s -o "$BASE_DIR/samples/img-r.accepted.tif" "$BASE/api/downloads/$DID3/content"
+cmp "$BASE_DIR/samples/img-r.tif" "$BASE_DIR/samples/img-r.accepted.tif"
+ok "修复前已受理但尚未读取的下载，修复后得到完整原件"
+
 say "演示完成"
 echo "浏览器入口: $RESTART_BASE/ （本脚本结束后服务已停止；手动启动见 README）"
 echo "服务日志:   $LOG 、 $BASE_DIR/server-restart.log"

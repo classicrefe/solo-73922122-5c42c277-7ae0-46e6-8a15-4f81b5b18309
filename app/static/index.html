@@ -40,6 +40,7 @@
   .b-deleted, .b-aborted, .b-failed, .b-interrupted { background: rgba(248,81,73,.15); color: var(--red); }
   .b-completed { background: rgba(63,185,80,.15); color: var(--green); }
   .b-created { background: rgba(79,156,249,.16); color: var(--accent); }
+  .b-verified { background: rgba(163,113,247,.18); color: var(--purple); }
   .b-idle { background: rgba(139,152,169,.18); color: var(--muted); }
   .progress { height: 10px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin: 8px 0 6px; }
   .progress > div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); transition: width .3s; }
@@ -83,7 +84,7 @@
     <div class="small" id="rot-numbers">—</div>
     <div class="row" style="margin-top:10px">
       <button id="btn-rotate">发起密钥轮换</button>
-      <span class="small">阻塞中上传 <b id="blk-up">0</b> · 阻塞中下载 <b id="blk-dl">0</b></span>
+      <span class="small">阻塞中上传 <b id="blk-up">0</b> · 下载 <b id="blk-dl">0</b> · 修复 <b id="blk-rp">0</b></span>
     </div>
     <h2 style="margin-top:16px">课题密钥目录 keys/（与 vault/ 密文分目录）</h2>
     <table><thead><tr><th>ID</th><th>key_id</th><th>状态</th><th>密钥文件</th><th>创建时间</th></tr></thead>
@@ -139,11 +140,31 @@
   <!-- 文件列表 / 下载 -->
   <section class="panel full">
     <h2>④ 已归档影像与下载 <span class="hint">受理即快照 KEK/封装DEK，轮换重封装后在途下载仍可读完</span></h2>
-    <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th></th></tr></thead>
+    <table><thead><tr><th>file_id</th><th>文件名</th><th>大小</th><th>封装密钥</th><th>SHA-256</th><th>归档时间</th><th>操作</th></tr></thead>
       <tbody id="files-body"></tbody></table>
     <h2 style="margin-top:16px">下载会话</h2>
     <table><thead><tr><th>download_id</th><th>文件</th><th>使用 KEK</th><th>状态</th><th>时间</th><th></th></tr></thead>
       <tbody id="downloads-body"></tbody></table>
+  </section>
+
+  <!-- 密文修复（备份恢复） -->
+  <section class="panel full">
+    <h2>⑤ 密文修复（备份恢复） <span class="hint">大小与 SHA-256 均与登记值相符，才用该件数据密钥重新加密并替换密文；文件 ID/摘要不变，原件与 DEK 不落盘</span></h2>
+    <div class="row">
+      <select id="repair-file" style="background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 10px;max-width:320px"></select>
+      <input type="file" id="repair-input" accept=".tif,.tiff" />
+      <button id="btn-repair">校验并修复</button>
+      <span class="small" id="repair-hint">备份须与登记大小、SHA-256 完全一致，且不超过 8 MiB</span>
+    </div>
+    <div class="steps">
+      <div class="step" id="rp-1">1. 受理修复（accepted，快照 KEK 与封装 DEK）</div>
+      <div class="step" id="rp-2">2. 大小 + SHA-256 双校验（verified，备份明文仅驻内存）</div>
+      <div class="step" id="rp-3">3. 同一 DEK 重新加密并原子替换密文（completed）</div>
+    </div>
+    <p class="small">演示损坏：在上方文件列表点击「模拟密文损坏」翻转 vault 密文字节，随后下载会报 GCM 校验失败；
+      用留存的原件备份在此修复后，新下载及已受理未读的下载都能得到完整原件。</p>
+    <table><thead><tr><th>repair_id</th><th>文件</th><th>大小</th><th>状态</th><th>SHA-256</th><th>时间</th><th>说明</th><th></th></tr></thead>
+      <tbody id="repairs-body"></tbody></table>
   </section>
 </main>
 
@@ -204,6 +225,34 @@ async function startDownload(fileId, name) {
 async function abortDownload(id) { await api('POST', `/api/downloads/${id}/abort`); log('已中止下载会话 ' + id.slice(0,8), ''); refresh(); }
 async function abortUpload(id) { await api('POST', `/api/uploads/${id}/abort`); log('已中止上传会话 ' + id.slice(0,8), ''); refresh(); }
 
+// ---------- 密文修复（备份恢复，三阶段） ----------
+async function corruptForDemo(fileId) {
+  try { await api('POST', `/api/files/${fileId}/demo/corrupt`);
+    log('已翻转 vault 密文字节模拟损坏，再下载应报 GCM 校验失败', 'err'); refresh();
+  } catch (e) { log('模拟损坏失败：' + e.message, 'err'); }
+}
+async function abortRepair(id) {
+  await api('POST', `/api/repairs/${id}/abort`); log('已中止修复会话 ' + id.slice(0,8), ''); refresh();
+}
+$('btn-repair').onclick = async () => {
+  const fileId = $('repair-file').value;
+  const f = $('repair-input').files[0];
+  if (!fileId) return log('请先选择要修复的归档项', 'err');
+  if (!f) return log('请先选择留存的原件备份（.tif/.tiff）', 'err');
+  try {
+    const init = await api('POST', `/api/files/${fileId}/repairs`, { size: f.size });
+    log(`修复受理 ${init.repair_id.slice(0,8)}…（登记大小 ${init.expected_size}，期望 SHA-256=${init.expected_sha256.slice(0,16)}…）`, 'info');
+    const buf = await f.arrayBuffer();
+    const saved = await fetch(`/api/repairs/${init.repair_id}/content`, { method:'PUT', body: buf }).then(async r => {
+      const d = await r.json().catch(()=>null); if (!r.ok) throw new Error(d?.error || r.statusText); return d;
+    });
+    log(`双校验通过：大小与 SHA-256=${saved.sha256.slice(0,16)}… 均与登记值相符，备份明文仅驻内存`, 'info');
+    const done = await api('POST', `/api/repairs/${init.repair_id}/complete`);
+    log(`密文已用同一数据密钥重新加密并原子替换，修复完成（${done.file_id ? done.file_id.slice(0,8)+'…' : ''}）`, 'ok');
+    await refresh();
+  } catch (e) { log('修复失败：' + e.message + '（原有可读副本保留，可重新发起修复）', 'err'); await refresh(); }
+};
+
 // ---------- 轮换 ----------
 $('btn-rotate').onclick = async () => {
   try { await api('POST', '/api/rotations'); log('已发起课题密钥轮换', 'info'); await refresh(); }
@@ -219,10 +268,11 @@ async function setGate(name, paused) {
 // ---------- 轮询渲染 ----------
 async function refresh() {
   try {
-    const [cfg, status, keys, files, uploads, downloads] = await Promise.all([
+    const [cfg, status, keys, files, uploads, downloads, repairs] = await Promise.all([
       api('GET','/api/config'), api('GET','/api/rotations/current'),
       api('GET','/api/keys'), api('GET','/api/files'),
       api('GET','/api/uploads'), api('GET','/api/downloads'),
+      api('GET','/api/repairs'),
     ]);
     $('health').textContent = '服务在线 · 上限 ' + cfg.max_file_size_mib + ' MiB/件';
     $('upload-hint').textContent = `单文件上限 ${cfg.max_file_size_mib} MiB`;
@@ -233,6 +283,7 @@ async function refresh() {
     $('btn-rotate').disabled = !!status.active;
     $('blk-up').textContent = status.active ? status.blocking_uploads : 0;
     $('blk-dl').textContent = status.active ? status.blocking_downloads : 0;
+    $('blk-rp').textContent = status.active ? status.blocking_repairs : 0;
     if (status.active) {
       const pct = status.total ? Math.round(status.rewrapped / status.total * 100) : 100;
       $('rot-bar').style.width = pct + '%';
@@ -253,8 +304,15 @@ async function refresh() {
       `<tr><td class="mono">${short(f.file_id)}</td><td class="truncate" title="${esc(f.filename)}">${esc(f.filename)}</td>
        <td>${fmtSize(f.size)}</td><td class="mono">#${f.kek_id} ${short(f.kek_key_id,8)}</td>
        <td class="mono small">${short(f.sha256,18)}</td><td class="small">${esc(f.created_at)}</td>
-       <td><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button></td></tr>`
+       <td class="row" style="gap:6px"><button onclick="startDownload('${f.file_id}','${esc(f.filename)}')">下载</button>
+       <button class="warn" onclick="corruptForDemo('${f.file_id}')" title="翻转 vault 密文字节，演示 GCM 校验失败">模拟密文损坏</button></td></tr>`
     ).join('') || '<tr><td colspan="7" class="small">暂无归档影像</td></tr>';
+
+    // 修复目标下拉框（保留当前选择）
+    const prevSel = $('repair-file').value;
+    $('repair-file').innerHTML = '<option value="">— 选择归档项 —</option>' + files.map(f =>
+      `<option value="${f.file_id}">${esc(f.filename)}（${short(f.file_id,8)}…，${fmtSize(f.size)}）</option>`).join('');
+    if (prevSel && files.some(f => f.file_id === prevSel)) $('repair-file').value = prevSel;
 
     $('uploads-body').innerHTML = uploads.map(u =>
       `<tr><td class="mono">${short(u.upload_id)}</td><td class="truncate">${esc(u.filename)}</td>
@@ -269,6 +327,14 @@ async function refresh() {
        <td>${['accepted','unwrapping'].includes(d.state) ? `<button class="secondary" onclick="abortDownload('${d.download_id}')">中止</button>` : ''}</td></tr>`
     ).join('') || '<tr><td colspan="6" class="small">暂无下载会话</td></tr>';
 
+    $('repairs-body').innerHTML = repairs.map(r =>
+      `<tr><td class="mono">${short(r.repair_id)}</td><td class="truncate">${esc(r.filename)}</td>
+       <td>${fmtSize(r.declared_size)}</td><td>${badge(r.state)}</td>
+       <td class="mono small">${short(r.sha256,16)}</td><td class="small">${esc(r.updated_at)}</td>
+       <td class="small" style="color:var(--red)">${esc(r.error || '')}</td>
+       <td>${['accepted','verified'].includes(r.state) ? `<button class="secondary" onclick="abortRepair('${r.repair_id}')">中止</button>` : ''}</td></tr>`
+    ).join('') || '<tr><td colspan="8" class="small">暂无修复会话</td></tr>';
+
     const gu = status.gates.upload_register, gd = status.gates.download_unwrap;
     $('g-up-state').textContent = (gu.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gu.waiting;
     $('g-dl-state').textContent = (gd.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gd.waiting;
@@ -279,6 +345,14 @@ async function refresh() {
     [1,2,3].forEach(i => {
       const el = $('st-'+i);
       el.className = 'step' + (stage >= i && stage > 0 ? (stage === i ? ' cur' : ' done') : '');
+    });
+
+    // 修复步骤条（取最新一条修复）
+    const latestRp = repairs[0];
+    const rpStage = latestRp ? { accepted:1, verified:2, completed:3, aborted:0, failed:0, interrupted:0 }[latestRp.state] ?? 0 : 0;
+    [1,2,3].forEach(i => {
+      const el = $('rp-'+i);
+      el.className = 'step' + (rpStage >= i && rpStage > 0 ? (rpStage === i ? ' cur' : ' done') : '');
     });
   } catch (e) {
     $('health').textContent = '服务不可用：' + e.message;

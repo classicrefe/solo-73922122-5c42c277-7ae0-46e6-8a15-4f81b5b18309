@@ -3,7 +3,7 @@
 FastAPI + SQLite + `cryptography` 实现的单课题 TIFF 加密归档网页：每件影像以独立随机
 数据密钥（DEK）做 AES-256-GCM 加密，DEK 再由课题密钥（KEK，AES-256-GCM）封装后入库；
 密文与课题密钥**分目录持久保存**，原件明文与数据密钥**绝不落盘**。支持上传、下载、
-课题密钥轮换及进度查看，轮换期间上传下载照常，重启自动续办。
+课题密钥轮换、**密文损坏后的备份修复**及进度查看，轮换期间上传下载照常，重启自动续办。
 
 ## 一、快速开始
 
@@ -21,9 +21,9 @@ open http://localhost:8000/        # macOS
 ```
 /data
 ├── keys/      # 课题密钥文件 *.kek（权限 600），与密文分目录
-├── vault/     # 已归档密文 *.blob（nonce || GCM 密文+tag）
-├── staging/   # 上传暂存密文（登记成功后原子移入 vault/，重启清理孤儿）
-└── archive.db # SQLite（WAL）：文件/上传/下载/轮换元数据与“封装后的 DEK”
+├── vault/     # 已归档密文 *.blob（nonce || GCM 密文+tag）；修复瞬间的旧密文备份 *.blob.bak
+├── staging/   # 上传暂存密文与修复新密文 *.new（登记/替换成功后原子移走，重启清理孤儿）
+└── archive.db # SQLite（WAL）：文件/上传/下载/修复/轮换元数据与“封装后的 DEK”
 ```
 
 停止与清理：
@@ -47,11 +47,14 @@ ARCHIVE_DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8000
 打开 `http://localhost:8000/`（单页应用，原生 JS，无构建步骤）：
 
 1. **课题密钥与轮换**：查看当前 KEK、`keys/` 目录状态，一键发起轮换，实时进度
-   （重封装件数、阻塞中的上传/下载数、旧钥文件是否已删除）；
+   （重封装件数、阻塞中的上传/下载/修复数、旧钥文件是否已删除）；
 2. **演示控制（暂停点）**：可分别暂停/恢复“上传待登记”和“下载待解封”两个闸门；
 3. **上传**：选择 `.tif/.tiff`（每件 ≤ 8 MiB），页面展示三阶段状态机；
 4. **已归档影像与下载**：查看每件影像当前封装在哪个 KEK 下，发起两阶段下载；
-5. **操作日志**：所有关键动作带时间戳输出。
+   每行提供“模拟密文损坏”按钮，翻转 vault 密文字节以演示 GCM 校验失败；
+5. **密文修复（备份恢复）**：选择归档项并上传留存的原件备份（≤ 8 MiB），大小与
+   SHA-256 均与登记值相符时才用该件数据密钥重新加密并原子替换密文，文件 ID/摘要不变；
+6. **操作日志**：所有关键动作带时间戳输出。
 
 ## 三、本地演示脚本
 
@@ -70,6 +73,7 @@ PORT=8090 ./scripts/demo.sh /tmp/demo
 | **上传待登记暂停** | 闸门关闭后上传停在 `pending_register`（DEK 仅在内存）；轮换停在收尾且 `blocking_uploads=1`；恢复后该上传由**新 KEK** 封装，不留下旧钥引用 |
 | **下载待解封暂停** | 已受理下载停在 `accepted`；轮换 `blocking_downloads=1` 且旧 KEK 文件保留；恢复后在途下载读完原件，轮换才完成 |
 | **轮换中重启** | 轮换未完成时退出；重启后自动续办至完成、未完成上传按规则失败并清理暂存、全部已归档文件仍可解密且与原件一致 |
+| **密文修复（备份恢复）** | 损坏密文下载被拒（GCM 500）；摘要不符的备份 422 且原副本保留；正确备份双校验后以同一 DEK 重加密并原子替换，文件 ID/摘要不变；在途修复 `blocking_repairs=1` 阻止旧钥退役，迟到修复与修复前已受理的下载都能得到完整原件 |
 
 受限沙箱（禁止 `kill` 系统调用）中用“同一数据目录 + 新端口新进程”模拟重启：
 
@@ -86,9 +90,11 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-9 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统），覆盖：明文不落盘不变量、
+20 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统），覆盖：明文不落盘不变量、
 8 MiB 上限、轮换只重封装 DEK 且密文逐字节不变、旧 KEK 文件删除后才报完成、两个暂停点、
-在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存。
+在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存，以及密文修复的
+双校验拒绝、原子替换保住可读副本、在途修复阻塞旧钥退役、迟到修复可解密、替换失败可
+重复修复、重启对账与已受理下载的原件完整性。
 
 ## 五、HTTP API 摘要
 
@@ -101,6 +107,12 @@ pytest -q
 | POST | `/api/files/{file_id}/downloads` | 受理下载，快照 KEK 标识与封装 DEK |
 | GET | `/api/downloads/{id}/content` | **待解封暂停点** → 解封并读完原件，返回明文 |
 | POST | `/api/downloads/{id}/abort` | 中止下载 |
+| POST | `/api/files/{file_id}/repairs` | 受理修复（body `{"size": n}`，与登记大小不符 422、>8 MiB 413） |
+| PUT | `/api/repairs/{id}/content` | 上传备份原件：大小 + SHA-256 双校验，明文仅驻内存（不符 422 且会话 failed） |
+| POST | `/api/repairs/{id}/complete` | 用该件 DEK 重新加密并原子替换密文（失败保留原副本，可重复修复） |
+| POST | `/api/repairs/{id}/abort` | 中止修复 |
+| GET | `/api/repairs` | 修复会话列表 |
+| POST | `/api/files/{file_id}/demo/corrupt` | 演示辅助：翻转 vault 密文字节制造 GCM 损坏 |
 | POST | `/api/rotations` | 发起轮换（已有轮换时 409） |
 | GET | `/api/rotations/current` | 轮换状态与进度（页面 1.5s 轮询） |
 | GET | `/api/files` `/api/keys` `/api/uploads` `/api/downloads` | 列表查询 |
@@ -125,21 +137,34 @@ pytest -q
 7. **暂停门与死锁规避**：闸门关闭时会话在检查点等待，等待期间释放全局锁并在唤醒后复查
    状态，避免与闸门控制请求死锁；服务关闭可在 1 个轮询周期内打断等待。
 8. **崩溃恢复（`_recover`）**：未完成上传（内存 DEK 已随进程消失）标记 `failed` 并清理
-   暂存；未完成下载标记 `interrupted`；清理孤儿暂存；未完成轮换重置为 `running` 并由
-   后台线程续办；已归档文件的 DEK 始终能被某个未删除的 KEK 解封，因此**始终可解密**。
-9. **并发模型**：单进程多线程，所有 SQLite 访问与共享状态在一把可重入锁内串行化，
-   SQLite 另开 WAL + `busy_timeout` 兜底；密钥文件、blob 均为原子替换写入。
+   暂存；未完成下载/修复标记 `interrupted`；清理孤儿暂存；对账修复替换遗留的
+   `*.new`/`*.bak`（事务未提交则用备份还原现网副本，已提交则清理备份）；未完成轮换
+   重置为 `running` 并由后台线程续办；已归档文件的 DEK 始终能被某个未删除的 KEK 解封，
+   因此**始终可解密**。
+9. **密文修复（备份恢复）不变量**：
+   - **双校验门槛**：备份的大小与 SHA-256 必须与 `files` 登记值完全一致，否则拒绝替换；
+   - **身份不变**：修复只换 vault 密文（新随机 nonce）与 `files.nonce`，文件 ID、文件名、
+     大小、摘要、KEK 封装均不变；同一 DEK 重新加密，DEK 明文与备份原件只在内存出现；
+   - **原子替换保可读**：旧密文同目录改名 `*.blob.bak` 后再落位新密文，任何失败都还原
+     旧副本，修复会话标记 `failed` 后可重复发起；提交后才删除备份，崩溃由启动对账兜底；
+   - **旧钥退役不坑迟到修复**：受理修复即快照 KEK 标识与封装 DEK，在途修复计入
+     `blocking_repairs`，旧 KEK 文件在其结束前不会删除；终态立即清空快照封装材料；
+   - **在途下载同原件**：修复提交时把已受理/解封中下载的 nonce 快照改指向新密文
+     （DEK 未变），新下载与先前已受理未读的下载都得到完整原件；解密失败的下载会话
+     转为 `interrupted` 并释放快照，不永久阻塞轮换收尾。
+10. **并发模型**：单进程多线程，所有 SQLite 访问与共享状态在一把可重入锁内串行化，
+    SQLite 另开 WAL + `busy_timeout` 兜底；密钥文件、blob 均为原子替换写入。
 
 ## 七、目录结构
 
 ```
 app/
 ├── crypto.py          # AES-256-GCM 原语：DEK/KEK 生成、封装/解封、密钥文件原子读写
-├── db.py              # SQLite schema（project_keys/files/uploads/downloads/rotations）
-├── service.py         # 状态机、轮换工作线程、暂停门、崩溃恢复（核心）
+├── db.py              # SQLite schema（project_keys/files/uploads/downloads/rotations/repairs）
+├── service.py         # 状态机、修复原子替换、轮换工作线程、暂停门、崩溃恢复（核心）
 ├── main.py            # FastAPI 路由与 lifespan
 └── static/index.html  # 浏览器单页应用
-scripts/demo.sh        # 三类场景的本地演示脚本
-tests/test_archive.py  # 9 个端到端测试
+scripts/demo.sh        # 四类场景（含密文修复）的本地演示脚本
+tests/test_archive.py  # 20 个端到端测试
 Dockerfile, docker-compose.yml
 ```

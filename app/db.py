@@ -83,11 +83,38 @@ CREATE TABLE IF NOT EXISTS rotations (
     rewrapped           INTEGER NOT NULL,
     blocking_uploads    INTEGER NOT NULL DEFAULT 0,
     blocking_downloads  INTEGER NOT NULL DEFAULT 0,
+    blocking_repairs    INTEGER NOT NULL DEFAULT 0,
     started_at          TEXT NOT NULL,
     completed_at        TEXT,
     message             TEXT
 );
+
+-- 密文修复（备份恢复）：accepted -> verified -> completed
+-- 受理时与下载会话一样快照该文件当时的 KEK 标识与封装 DEK：在途修复会阻止
+-- 旧 KEK 退役，因此即使轮换已经发起，“迟到”的修复仍能解封该件 DEK；
+-- 到达终态后立即清空封装材料，不残留旧钥引用。备份原件明文只在内存中参与
+-- 校验与重新加密，绝不落盘；文件 ID、摘要等登记信息在修复中保持不变。
+CREATE TABLE IF NOT EXISTS repairs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    repair_id     TEXT UNIQUE NOT NULL,
+    file_id       INTEGER NOT NULL REFERENCES files(id),
+    declared_size INTEGER NOT NULL,
+    sha256        TEXT,
+    state         TEXT NOT NULL CHECK (state IN (
+                     'accepted', 'verified', 'completed', 'failed', 'aborted', 'interrupted')),
+    kek_id        INTEGER NOT NULL REFERENCES project_keys(id),
+    wrapped_dek   BLOB,
+    dek_nonce     BLOB,
+    nonce         BLOB,
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
 """
+
+# 旧版本数据库升级：rotations 表补充“阻塞中的修复”计数列。
+ROTATION_MIGRATIONS = ("ALTER TABLE rotations ADD COLUMN blocking_repairs "
+                       "INTEGER NOT NULL DEFAULT 0",)
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -98,4 +125,11 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    for stmt in ROTATION_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:  # 列已存在等：幂等升级
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.commit()
     return conn
